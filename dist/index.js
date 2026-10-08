@@ -14628,9 +14628,70 @@ var import_parser = __toESM(require_lib(), 1);
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+var BUILTIN_TOOL_NAMES = /* @__PURE__ */ new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
+function estimateTokens(text) {
+  if (!text) return 0;
+  let cjkCount = 0;
+  let otherCount = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 19968 && code <= 40959 || code >= 13312 && code <= 19903 || code >= 12288 && code <= 12351 || code >= 65280 && code <= 65519) {
+      cjkCount++;
+    } else {
+      otherCount++;
+    }
+  }
+  const est = Math.round(cjkCount * 1.3 + otherCount / 3.6);
+  return Math.max(1, est);
+}
 function getPiBaseDir() {
   return process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
 }
+var BUILTIN_FACTORY_SCHEMAS = {
+  createReadToolDefinition: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Path to file to read" },
+      offset: { type: "number", description: "Start line number (1-based)" },
+      limit: { type: "number", description: "Maximum lines to read" }
+    },
+    required: ["path"]
+  },
+  createWriteToolDefinition: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Path to file to write" },
+      content: { type: "string", description: "Content to write to file" }
+    },
+    required: ["path", "content"]
+  },
+  createEditToolDefinition: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Path to file to edit" },
+      edits: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            oldText: { type: "string", description: "Text to replace" },
+            newText: { type: "string", description: "Replacement text" }
+          },
+          required: ["oldText", "newText"]
+        }
+      }
+    },
+    required: ["path", "edits"]
+  },
+  createBashToolDefinition: {
+    type: "object",
+    properties: {
+      command: { type: "string", description: "Bash command to execute" },
+      timeout: { type: "number", description: "Optional timeout in seconds" }
+    },
+    required: ["command"]
+  }
+};
 function resolvePackageDir(input, baseDir) {
   const rawInput = typeof input === "object" && input !== null ? input.source || "" : String(input || "");
   if (!rawInput) return null;
@@ -14708,8 +14769,17 @@ function evalAstNode(node, scope = /* @__PURE__ */ new Map(), visited = /* @__PU
         return node.value;
       case "NullLiteral":
         return null;
-      case "TemplateLiteral":
-        return node.quasis.map((q) => q.value.raw).join("");
+      case "TemplateLiteral": {
+        let res = "";
+        for (let i = 0; i < node.quasis.length; i++) {
+          res += node.quasis[i].value.raw;
+          if (i < node.expressions.length) {
+            const val = evalAstNode(node.expressions[i], scope, visited);
+            res += val !== void 0 ? String(val) : "";
+          }
+        }
+        return res;
+      }
       case "BinaryExpression": {
         if (node.operator === "+") {
           const left = evalAstNode(node.left, scope, visited);
@@ -14752,6 +14822,38 @@ function evalAstNode(node, scope = /* @__PURE__ */ new Map(), visited = /* @__PU
         }
         return obj;
       }
+      case "MemberExpression": {
+        const obj = evalAstNode(node.object, scope, visited);
+        const propName = node.property.type === "Identifier" ? node.property.name : evalAstNode(node.property, scope, visited);
+        if (obj && typeof obj === "object" && propName && propName in obj) {
+          return obj[propName];
+        }
+        if (typeof propName === "string") return propName;
+        return void 0;
+      }
+      case "ArrowFunctionExpression":
+      case "FunctionExpression": {
+        const fnScope = new Map(scope);
+        for (const p of node.params) {
+          if (p.type === "Identifier") {
+            fnScope.set(p.name, {
+              grep: "ffgrep",
+              find: "fffind",
+              multiGrep: "fff-multi-grep",
+              [p.name]: p.name
+            });
+          }
+        }
+        if (node.body.type !== "BlockStatement") {
+          return evalAstNode(node.body, fnScope, visited);
+        }
+        for (const stmt of node.body.body) {
+          if (stmt.type === "ReturnStatement" && stmt.argument) {
+            return evalAstNode(stmt.argument, fnScope, visited);
+          }
+        }
+        return void 0;
+      }
       case "CallExpression": {
         let fnName = "";
         if (node.callee.type === "MemberExpression") {
@@ -14759,15 +14861,27 @@ function evalAstNode(node, scope = /* @__PURE__ */ new Map(), visited = /* @__PU
         } else if (node.callee.type === "Identifier") {
           fnName = node.callee.name;
         }
+        for (const [factoryName, schema] of Object.entries(BUILTIN_FACTORY_SCHEMAS)) {
+          if (fnName.includes(factoryName)) {
+            return { parameters: schema };
+          }
+        }
         const args = node.arguments.map((a) => evalAstNode(a, scope, visited));
         if (fnName === "Type.String") return { type: "string", ...args[0] || {} };
         if (fnName === "Type.Number") return { type: "number", ...args[0] || {} };
+        if (fnName === "Type.Integer") return { type: "integer", ...args[0] || {} };
         if (fnName === "Type.Boolean") return { type: "boolean", ...args[0] || {} };
         if (fnName === "Type.Object") return { type: "object", properties: args[0] || {}, ...args[1] || {} };
         if (fnName === "Type.Array") return { type: "array", items: args[0], ...args[1] || {} };
         if (fnName === "Type.Optional") return { ...args[0] || {}, optional: true };
+        if (fnName === "Type.Union") return { anyOf: Array.isArray(args[0]) ? args[0] : [args[0]], ...args[1] || {} };
+        if (fnName === "Type.Intersect") return { allOf: Array.isArray(args[0]) ? args[0] : [args[0]], ...args[1] || {} };
         if (fnName === "Type.Record") return { type: "object", ...args[1] || {} };
+        if (fnName === "Type.Literal") return { const: args[0], ...args[1] || {} };
         if (fnName === "StringEnum") return { type: "string", enum: args[0], ...args[1] || {} };
+        if (node.callee.type === "ArrowFunctionExpression" || node.callee.type === "FunctionExpression") {
+          return evalAstNode(node.callee, scope, visited);
+        }
         return { type: fnName, args };
       }
       case "TSAsExpression":
@@ -14818,26 +14932,126 @@ function analyzePlugin(pkgName, pkgDir) {
         errorRecovery: true
       });
       parsedList.push({ file: f, ast });
-      for (const node of ast.program.body) {
-        let decls = [];
-        if (node.type === "VariableDeclaration") decls = node.declarations;
-        else if (node.type === "ExportNamedDeclaration" && node.declaration?.type === "VariableDeclaration") {
-          decls = node.declaration.declarations;
-        }
-        for (const d of decls) {
-          if (d.id?.type === "Identifier" && d.init) {
-            scope.set(d.id.name, d.init);
+      const collectDecls = (node) => {
+        if (!node || typeof node !== "object") return;
+        if (node.type === "VariableDeclaration") {
+          for (const d of node.declarations) {
+            if (d.id?.type === "Identifier" && d.init) {
+              if (!scope.has(d.id.name)) {
+                scope.set(d.id.name, d.init);
+              }
+            }
           }
         }
-      }
+        for (const key of Object.keys(node)) {
+          if (key === "parent") continue;
+          const child = node[key];
+          if (Array.isArray(child)) child.forEach(collectDecls);
+          else if (child && typeof child === "object") collectDecls(child);
+        }
+      };
+      collectDecls(ast.program);
     } catch {
     }
   }
+  if (!scope.has("toolNames")) {
+    scope.set("toolNames", { grep: "ffgrep", find: "fffind", multiGrep: "fff-multi-grep" });
+  }
+  let sessionStartUnloadsTools = false;
+  for (const { ast } of parsedList) {
+    const checkSessionStart = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (node.type === "CallExpression" && node.callee?.property?.name === "on" && node.arguments?.[0]?.value === "session_start") {
+        const cb = node.arguments[1];
+        const walkCb = (n) => {
+          if (!n || typeof n !== "object") return;
+          if (n.type === "CallExpression") {
+            const name = n.callee.name || n.callee.property?.name || "";
+            if (name.toLowerCase().includes("disable") || name === "setActiveTools") {
+              sessionStartUnloadsTools = true;
+            }
+          }
+          for (const k of Object.keys(n)) {
+            if (k !== "parent") {
+              const c = n[k];
+              if (Array.isArray(c)) c.forEach(walkCb);
+              else if (c && typeof c === "object") walkCb(c);
+            }
+          }
+        };
+        walkCb(cb);
+      }
+      for (const key of Object.keys(node)) {
+        if (key !== "parent") {
+          const child = node[key];
+          if (Array.isArray(child)) child.forEach(checkSessionStart);
+          else if (child && typeof child === "object") checkSessionStart(child);
+        }
+      }
+    };
+    checkSessionStart(ast.program);
+  }
   const rawTools = [];
   const commands = [];
+  const promptInjections = [];
   for (const { ast } of parsedList) {
-    let walk = function(node, parent) {
+    let walk = function(node, parent, currentCondition) {
       if (!node || typeof node !== "object") return;
+      let nextCondition = currentCondition;
+      if (node.type === "IfStatement" && node.test) {
+        if (node.test.type === "Identifier") {
+          nextCondition = node.test.name;
+        } else if (node.test.type === "BinaryExpression") {
+          const l = evalAstNode(node.test.left, scope) ?? "expr";
+          const r = evalAstNode(node.test.right, scope) ?? "val";
+          nextCondition = `${l} ${node.test.operator} ${r}`;
+        } else if (node.test.type === "CallExpression") {
+          const fn = node.test.callee.name || node.test.callee.property?.name || "condition";
+          const firstArg = evalAstNode(node.test.arguments[0], scope) ?? "";
+          nextCondition = `${fn}(${firstArg})`;
+        } else {
+          nextCondition = "conditional";
+        }
+      }
+      if (node.type === "CallExpression" && node.callee?.property?.name === "on" && node.arguments?.[0]?.value === "before_agent_start") {
+        const cb = node.arguments[1];
+        let foundPromptText = "";
+        const inspectPromptHook = (n) => {
+          if (!n || typeof n !== "object") return;
+          if (n.type === "Identifier" && scope.has(n.name)) {
+            const val = evalAstNode(scope.get(n.name), scope);
+            if (typeof val === "string" && val.length > 30) {
+              foundPromptText = val;
+            }
+          } else if (n.type === "StringLiteral" && n.value.length > 30) {
+            foundPromptText = n.value;
+          } else if (n.type === "TemplateLiteral") {
+            const text = evalAstNode(n, scope);
+            if (typeof text === "string" && text.length > 30) {
+              foundPromptText = text;
+            }
+          }
+          for (const k of Object.keys(n)) {
+            if (k !== "parent") {
+              const c = n[k];
+              if (Array.isArray(c)) c.forEach(inspectPromptHook);
+              else if (c && typeof c === "object") inspectPromptHook(c);
+            }
+          }
+        };
+        inspectPromptHook(cb);
+        if (foundPromptText) {
+          const chars = foundPromptText.length;
+          const tokens = estimateTokens(foundPromptText);
+          promptInjections.push({
+            event: "before_agent_start",
+            description: "Dynamic system prompt injection",
+            content: foundPromptText,
+            chars,
+            estTokens: tokens
+          });
+        }
+      }
       if (node.type === "ObjectExpression") {
         const isArrayMethod = parent && parent.type === "CallExpression" && (parent.callee?.property?.name === "push" || parent.callee?.property?.name === "unshift");
         if (!isArrayMethod) {
@@ -14861,6 +15075,15 @@ function analyzePlugin(pkgName, pkgDir) {
                   evaluated.name = evaluated.promptSnippet.split(" ")[0].toLowerCase();
                 }
               }
+              if (sessionStartUnloadsTools) {
+                evaluated.status = "on-demand";
+              } else if (currentCondition && (currentCondition.includes('=== "1"') || currentCondition.includes("== 1"))) {
+                evaluated.status = "conditional";
+                evaluated.conditionDesc = currentCondition;
+              } else {
+                evaluated.status = "active";
+                if (currentCondition) evaluated.conditionDesc = currentCondition;
+              }
               rawTools.push(evaluated);
             }
           }
@@ -14877,12 +15100,12 @@ function analyzePlugin(pkgName, pkgDir) {
       for (const key of Object.keys(node)) {
         if (key !== "parent") {
           const child = node[key];
-          if (Array.isArray(child)) child.forEach((c) => walk(c, node));
-          else if (child && typeof child === "object") walk(child, node);
+          if (Array.isArray(child)) child.forEach((c) => walk(c, node, nextCondition));
+          else if (child && typeof child === "object") walk(child, node, nextCondition);
         }
       }
     };
-    walk(ast.program, null);
+    walk(ast.program, null, void 0);
   }
   const tools = [];
   const seenNames = /* @__PURE__ */ new Set();
@@ -14893,9 +15116,14 @@ function analyzePlugin(pkgName, pkgDir) {
     const desc = typeof t.description === "string" ? t.description : "";
     const snippet = typeof t.promptSnippet === "string" ? t.promptSnippet : "";
     const guidelines = Array.isArray(t.promptGuidelines) ? t.promptGuidelines.filter((g) => typeof g === "string") : typeof t.promptGuidelines === "string" ? [t.promptGuidelines] : [];
-    const schemaStr = t.parameters ? JSON.stringify(t.parameters, null, 2) : "";
-    const totalChars2 = desc.length + snippet.length + guidelines.join("\n").length + schemaStr.length;
-    const estTokens2 = Math.round(totalChars2 / 3.5);
+    let schemaObj = t.parameters;
+    if (typeof schemaObj === "string" && scope.has(schemaObj)) {
+      schemaObj = evalAstNode(scope.get(schemaObj), scope);
+    }
+    const schemaStr = schemaObj ? JSON.stringify(schemaObj, null, 2) : "";
+    const fullPromptText = [desc, snippet, ...guidelines, schemaStr].filter(Boolean).join("\n");
+    const totalChars2 = fullPromptText.length;
+    const estTokens2 = estimateTokens(fullPromptText);
     tools.push({
       name,
       description: desc,
@@ -14903,22 +15131,54 @@ function analyzePlugin(pkgName, pkgDir) {
       promptGuidelines: guidelines,
       parametersStr: schemaStr,
       totalChars: totalChars2,
-      estTokens: estTokens2
+      estTokens: estTokens2,
+      status: t.status || "active",
+      conditionDesc: t.conditionDesc
     });
   }
+  const isBuiltinOverride = tools.length > 0 && tools.every((t) => BUILTIN_TOOL_NAMES.has(t.name) || t.name === "name");
   let totalChars = 0;
-  for (const t of tools) totalChars += t.totalChars;
-  const estTokens = Math.round(totalChars / 3.5);
+  let estTokens = 0;
+  let activeTokens = 0;
+  if (!isBuiltinOverride) {
+    for (const t of tools) {
+      totalChars += t.totalChars;
+      estTokens += t.estTokens;
+      if (t.status === "active") {
+        activeTokens += t.estTokens;
+      }
+    }
+  }
+  for (const inj of promptInjections) {
+    totalChars += inj.chars;
+    estTokens += inj.estTokens;
+    activeTokens += inj.estTokens;
+  }
   let type = "active-tools";
-  if (tools.length === 0 && commands.length > 0) type = "command-only";
-  else if (tools.length === 0) type = "theme-or-library";
+  const hasActiveTools = tools.some((t) => t.status === "active");
+  const hasOnDemandTools = tools.some((t) => t.status === "on-demand");
+  if (isBuiltinOverride) {
+    type = "builtin-override";
+  } else if (hasActiveTools) {
+    type = "active-tools";
+  } else if (hasOnDemandTools) {
+    type = "on-demand-tools";
+  } else if (promptInjections.length > 0) {
+    type = "prompt-inject";
+  } else if (commands.length > 0) {
+    type = "command-only";
+  } else {
+    type = "theme-or-library";
+  }
   return {
     pkgName,
     pkgDir,
     tools,
     commands: Array.from(new Set(commands)),
+    promptInjections,
     totalChars,
     estTokens,
+    activeTokens,
     type
   };
 }
@@ -14944,6 +15204,41 @@ function buildLeaderboard() {
     } catch {
     }
   }
+  const localExtensionDirs = [
+    path.join(piBaseDir, "extensions"),
+    path.join(process.cwd(), ".pi", "extensions")
+  ];
+  for (const extDir of localExtensionDirs) {
+    if (!fs.existsSync(extDir)) continue;
+    try {
+      const entries = fs.readdirSync(extDir);
+      for (const entry of entries) {
+        if (entry.startsWith(".")) continue;
+        const fullPath = path.join(extDir, entry);
+        let stat;
+        try {
+          stat = fs.statSync(fullPath);
+        } catch {
+          continue;
+        }
+        if (stat.isFile() && !/\.(ts|js|mjs)$/.test(entry)) continue;
+        let alreadyTracked = false;
+        const normalizedEntry = entry.replace(/\.(ts|js|mjs)$/, "");
+        for (const existingKey of packagesMap.keys()) {
+          const cleanKey = existingKey.replace(/^(npm:|git:)/, "").replace(/@[^/]+$/, "");
+          if (cleanKey.endsWith("/" + normalizedEntry) || cleanKey === normalizedEntry) {
+            alreadyTracked = true;
+            break;
+          }
+        }
+        const name = `local:${entry}`;
+        if (!alreadyTracked && !packagesMap.has(name)) {
+          packagesMap.set(name, { entry: fullPath, baseDir: extDir });
+        }
+      }
+    } catch {
+    }
+  }
   const list = [];
   for (const [key, { entry, baseDir }] of packagesMap.entries()) {
     const dir = resolvePackageDir(entry, baseDir);
@@ -14953,8 +15248,10 @@ function buildLeaderboard() {
         pkgDir: "",
         tools: [],
         commands: [],
+        promptInjections: [],
         totalChars: 0,
         estTokens: 0,
+        activeTokens: 0,
         type: "directory-not-found"
       });
       continue;
@@ -14966,20 +15263,33 @@ function buildLeaderboard() {
 }
 function formatLeaderboard(list) {
   const lines = [];
-  lines.push("==========================================================================================");
+  lines.push("==========================================================================================================");
   lines.push("\u{1F3C6} Installed Pi Extensions Token Footprint Leaderboard");
-  lines.push("==========================================================================================");
-  lines.push(`  ${"Package Name".padEnd(40)} | ${"Type".padEnd(20)} | Tools | Chars      | Est. Tokens`);
-  lines.push("------------------------------------------------------------------------------------------");
+  lines.push("==========================================================================================================");
+  lines.push(`  ${"Package Name".padEnd(38)} | ${"Type".padEnd(16)} | Tools | Chars      | Est. Tokens`);
+  lines.push("----------------------------------------------------------------------------------------------------------");
   for (const item of list) {
-    const nameStr = item.pkgName.length > 38 ? item.pkgName.slice(0, 35) + "..." : item.pkgName;
+    const nameStr = item.pkgName.length > 36 ? item.pkgName.slice(0, 33) + "..." : item.pkgName;
     const typeStr = item.type;
     const countStr = String(item.tools.length).padStart(4);
     const charsStr = String(item.totalChars.toLocaleString()).padStart(10);
-    const tokenStr = item.estTokens > 0 ? `~${item.estTokens.toLocaleString()} tk` : "0 tk";
-    lines.push(`  ${nameStr.padEnd(40)} | ${typeStr.padEnd(20)} | ${countStr}  | ${charsStr} | ${tokenStr}`);
+    let tokenStr = "0 tk";
+    if (item.type === "on-demand-tools") {
+      tokenStr = `~${item.estTokens.toLocaleString()} tk (on-demand)`;
+    } else if (item.type === "prompt-inject") {
+      tokenStr = `~${item.estTokens.toLocaleString()} tk (inject)`;
+    } else if (item.type === "builtin-override") {
+      tokenStr = "0 tk (override)";
+    } else if (item.estTokens > 0) {
+      if (item.activeTokens < item.estTokens && item.activeTokens > 0) {
+        tokenStr = `~${item.activeTokens.toLocaleString()} tk (~${item.estTokens} max)`;
+      } else {
+        tokenStr = `~${item.estTokens.toLocaleString()} tk`;
+      }
+    }
+    lines.push(`  ${nameStr.padEnd(38)} | ${typeStr.padEnd(16)} | ${countStr}  | ${charsStr} | ${tokenStr}`);
   }
-  lines.push("==========================================================================================");
+  lines.push("==========================================================================================================");
   return lines;
 }
 
@@ -15034,7 +15344,9 @@ var LeaderboardViewComponent = class {
         output.push(truncateToWidth(th.fg("accent", th.bold(line)), width));
       } else if (line.includes("active-tools")) {
         output.push(truncateToWidth(th.fg("warning", line), width));
-      } else if (line.includes("0 tk") || line.includes("command-only") || line.includes("theme-or-library")) {
+      } else if (line.includes("on-demand-tools") || line.includes("prompt-inject")) {
+        output.push(truncateToWidth(th.fg("accent", line), width));
+      } else if (line.includes("0 tk") || line.includes("command-only") || line.includes("theme-or-library") || line.includes("builtin-override")) {
         output.push(truncateToWidth(th.fg("muted", line), width));
       } else {
         output.push(truncateToWidth(th.fg("text", line), width));
@@ -15058,26 +15370,30 @@ function index_default(pi) {
         return;
       }
       const res = analyzePlugin(cleanArg, dir);
-      const estMin = Math.round(res.totalChars / 4);
-      const estMax = Math.round(res.totalChars / 3.3);
+      const estMin = Math.round(res.estTokens * 0.9);
+      const estMax = Math.round(res.estTokens * 1.15);
       const msg = [
         `\u{1F4E6} Package: ${cleanArg} (${res.type})`,
-        `\u{1F6E0}\uFE0F Tools: ${res.tools.length}`,
+        `\u{1F6E0}\uFE0F Tools: ${res.tools.length}${res.activeTokens !== res.estTokens ? ` (active: ~${res.activeTokens} tk)` : ""}`,
+        res.promptInjections.length > 0 ? `\u{1F489} Prompt injections: ${res.promptInjections.length}` : "",
         `\u{1F4CA} Prompt text: ${res.totalChars.toLocaleString()} chars`,
-        `\u{1F4A1} Est. Token Footprint: ~${estMin} - ${estMax} tokens`
-      ].join("\n");
+        `\u{1F4A1} Est. Token Footprint: ~${res.estTokens.toLocaleString()} tokens`
+      ].filter(Boolean).join("\n");
       if (ctx.mode === "tui" && ctx.hasUI) {
         await ctx.ui.custom((_tui, theme, _kb, done) => {
           const lines = [
             `Package: ${cleanArg} (${res.type})`,
             `Location: ${dir}`,
-            `Tools: ${res.tools.length} | Commands: ${res.commands.length}`,
+            `Tools: ${res.tools.length} | Commands: ${res.commands.length} | Injections: ${res.promptInjections.length}`,
             "----------------------------------------------------------------",
             ...res.tools.map(
-              (t) => `[Tool: ${t.name}] ${t.totalChars} chars / ~${t.estTokens} tokens (desc: ${t.description.length}c, rules: ${t.promptGuidelines.join(" ").length}c, schema: ${t.parametersStr.length}c)`
+              (t) => `[Tool: ${t.name}${t.status !== "active" ? ` (${t.status})` : ""}] ${t.totalChars} chars / ~${t.estTokens} tokens (desc: ${t.description.length}c, rules: ${t.promptGuidelines.join(" ").length}c, schema: ${t.parametersStr.length}c)`
+            ),
+            ...res.promptInjections.map(
+              (inj) => `[Prompt Injection: ${inj.event}] ${inj.chars} chars / ~${inj.estTokens} tokens ("${inj.content.slice(0, 40)}...")`
             ),
             "----------------------------------------------------------------",
-            `Total: ${res.totalChars.toLocaleString()} chars / ~${estMin} - ${estMax} tokens`
+            `Total: ${res.totalChars.toLocaleString()} chars / ~${res.estTokens.toLocaleString()} tokens${res.activeTokens !== res.estTokens ? ` (active: ~${res.activeTokens.toLocaleString()} tk)` : ""}`
           ];
           return new LeaderboardViewComponent(lines, theme, () => done());
         });

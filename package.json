@@ -1,6 +1,6 @@
 {
   "name": "pi-extension-token-checker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Inspect and audit system-prompt token footprints of installed Pi extensions using static AST analysis.",
   "type": "module",
   "main": "./dist/index.js",

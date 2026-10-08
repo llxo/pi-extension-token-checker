@@ -72,7 +72,14 @@ class LeaderboardViewComponent {
         output.push(truncateToWidth(th.fg("accent", th.bold(line)), width));
       } else if (line.includes("active-tools")) {
         output.push(truncateToWidth(th.fg("warning", line), width));
-      } else if (line.includes("0 tk") || line.includes("command-only") || line.includes("theme-or-library")) {
+      } else if (line.includes("on-demand-tools") || line.includes("prompt-inject")) {
+        output.push(truncateToWidth(th.fg("accent", line), width));
+      } else if (
+        line.includes("0 tk") ||
+        line.includes("command-only") ||
+        line.includes("theme-or-library") ||
+        line.includes("builtin-override")
+      ) {
         output.push(truncateToWidth(th.fg("muted", line), width));
       } else {
         output.push(truncateToWidth(th.fg("text", line), width));
@@ -100,29 +107,34 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
       const res = analyzePlugin(cleanArg, dir);
-      const estMin = Math.round(res.totalChars / 4);
-      const estMax = Math.round(res.totalChars / 3.3);
+      const estMin = Math.round(res.estTokens * 0.9);
+      const estMax = Math.round(res.estTokens * 1.15);
 
       const msg = [
         `📦 Package: ${cleanArg} (${res.type})`,
-        `🛠️ Tools: ${res.tools.length}`,
+        `🛠️ Tools: ${res.tools.length}${res.activeTokens !== res.estTokens ? ` (active: ~${res.activeTokens} tk)` : ""}`,
+        res.promptInjections.length > 0 ? `💉 Prompt injections: ${res.promptInjections.length}` : "",
         `📊 Prompt text: ${res.totalChars.toLocaleString()} chars`,
-        `💡 Est. Token Footprint: ~${estMin} - ${estMax} tokens`,
-      ].join("\n");
+        `💡 Est. Token Footprint: ~${res.estTokens.toLocaleString()} tokens`,
+      ].filter(Boolean).join("\n");
 
       if (ctx.mode === "tui" && ctx.hasUI) {
         await ctx.ui.custom((_tui: any, theme: Theme, _kb: any, done: () => void) => {
           const lines = [
             `Package: ${cleanArg} (${res.type})`,
             `Location: ${dir}`,
-            `Tools: ${res.tools.length} | Commands: ${res.commands.length}`,
+            `Tools: ${res.tools.length} | Commands: ${res.commands.length} | Injections: ${res.promptInjections.length}`,
             "----------------------------------------------------------------",
             ...res.tools.map(
               (t) =>
-                `[Tool: ${t.name}] ${t.totalChars} chars / ~${t.estTokens} tokens (desc: ${t.description.length}c, rules: ${t.promptGuidelines.join(" ").length}c, schema: ${t.parametersStr.length}c)`,
+                `[Tool: ${t.name}${t.status !== "active" ? ` (${t.status})` : ""}] ${t.totalChars} chars / ~${t.estTokens} tokens (desc: ${t.description.length}c, rules: ${t.promptGuidelines.join(" ").length}c, schema: ${t.parametersStr.length}c)`,
+            ),
+            ...res.promptInjections.map(
+              (inj) =>
+                `[Prompt Injection: ${inj.event}] ${inj.chars} chars / ~${inj.estTokens} tokens ("${inj.content.slice(0, 40)}...")`,
             ),
             "----------------------------------------------------------------",
-            `Total: ${res.totalChars.toLocaleString()} chars / ~${estMin} - ${estMax} tokens`,
+            `Total: ${res.totalChars.toLocaleString()} chars / ~${res.estTokens.toLocaleString()} tokens${res.activeTokens !== res.estTokens ? ` (active: ~${res.activeTokens.toLocaleString()} tk)` : ""}`,
           ];
           return new LeaderboardViewComponent(lines, theme, () => done());
         });
