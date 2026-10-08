@@ -1,0 +1,43 @@
+{
+  "name": "pi-extension-token-checker",
+  "version": "0.1.0",
+  "description": "Inspect and audit system-prompt token footprints of installed Pi extensions using static AST analysis.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "pi-coding-agent",
+    "token",
+    "token-footprint",
+    "checker"
+  ],
+  "author": "llxo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/llxo/pi-extension-token-checker.git"
+  },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "esbuild extensions/index.ts --bundle --platform=node --format=esm --external:@earendil-works/* --outfile=dist/index.js"
+  },
+  "devDependencies": {
+    "@babel/parser": "^7.26.9",
+    "esbuild": "^0.28.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
